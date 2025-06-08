@@ -6,9 +6,10 @@ import 'package:http/http.dart' as http;
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:audio/audio.dart';
 
-import 'theme.dart';
 import 'chat_card.dart';
 import 'evi_message.dart' as evi;
+import 'pinecone_service.dart';
+import 'hume_tts_service.dart';
 
 class ConfigManager {
   static final ConfigManager _instance = ConfigManager._internal();
@@ -16,6 +17,11 @@ class ConfigManager {
   String humeApiKey = "";
   String humeAccessToken = "";
   late final String humeConfigId;
+  
+  // Pinecone configuration
+  late final String pineconeApiKey;
+  late final String pineconeAssistantName;
+  late final String pineconeBaseUrl;
 
   ConfigManager._internal();
 
@@ -52,6 +58,11 @@ class ConfigManager {
     // Uncomment this to use an access token in production.
     // humeAccessToken = await fetchAccessToken();
     humeConfigId = dotenv.env['HUME_CONFIG_ID'] ?? '';
+    
+    // Load Pinecone configuration
+    pineconeApiKey = dotenv.env['PINECONE_API_KEY'] ?? '';
+    pineconeAssistantName = dotenv.env['PINECONE_ASSISTANT_NAME'] ?? 'tes';
+    pineconeBaseUrl = dotenv.env['PINECONE_BASE_URL'] ?? 'https://prod-1-data.ke.pinecone.io';
   }
 }
 
@@ -73,17 +84,23 @@ class MyApp extends StatelessWidget {
     if (ConfigManager.instance.humeApiKey.isEmpty &&
         ConfigManager.instance.humeAccessToken.isEmpty) {
       return MaterialApp(
-          title: 'Flutter with EVI',
+          debugShowCheckedModeBanner: false,
+          title: 'Nissan Voice Assistant',
           home: ErrorMessage(
             message:
-                "Error: Please set your Hume API key in main.dart (or use fetchAccessToken)",
+                "Error: Please set your Hume API key in .env file",
           ),
-          theme: appTheme);
+          theme: ThemeData(
+            colorScheme: ColorScheme.fromSeed(seedColor: Colors.grey),
+          ));
     }
     return MaterialApp(
-      title: 'Flutter with EVI',
-      home: MyHomePage(title: 'Flutter with EVI'),
-      theme: appTheme,
+      debugShowCheckedModeBanner: false,
+      title: 'Nissan Voice Assistant',
+      home: const MyHomePage(),
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.grey),
+      ),
     );
   }
 
@@ -113,31 +130,55 @@ class ErrorMessage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Center(
-      child: Text(
-        message,
-        style: Theme.of(context).textTheme.headlineLarge,
+    return Scaffold(
+      backgroundColor: Colors.white,
+      body: Center(
+        child: Text(
+          message,
+          style: const TextStyle(fontSize: 18, color: Colors.red),
+          textAlign: TextAlign.center,
+        ),
       ),
     );
   }
 }
 
 class MyHomePage extends StatefulWidget {
-  final String title;
-
-  const MyHomePage({super.key, required this.title});
+  const MyHomePage({super.key});
 
   @override
   State<MyHomePage> createState() => _MyHomePageState();
 }
 
 class _MyHomePageState extends State<MyHomePage> {
-  // define config here for recorder
+  final TextEditingController _controller = TextEditingController();
+  
+  // Hume AI EVI components
   final Audio _audio = Audio();
   WebSocketChannel? _chatChannel;
   bool _isConnected = false;
   bool _isMuted = false;
   var chatEntries = <ChatEntry>[];
+  
+  // Pinecone service
+  late PineconeService _pineconeService;
+  late HumeTTSService _ttsService;
+
+  @override
+  void initState() {
+    super.initState();
+    // Initialize Pinecone service
+    _pineconeService = PineconeService(
+      apiKey: ConfigManager.instance.pineconeApiKey,
+      assistantName: ConfigManager.instance.pineconeAssistantName,
+      baseUrl: ConfigManager.instance.pineconeBaseUrl,
+    );
+    
+    // Initialize TTS service
+    _ttsService = HumeTTSService(
+      apiKey: ConfigManager.instance.humeApiKey,
+    );
+  }
 
   // EVI sends back transcripts of both the user's speech and the assistants speech, along
   // with an analysis of the emotional content of the speech. This method takes
@@ -155,56 +196,287 @@ class _MyHomePageState extends State<MyHomePage> {
     });
   }
 
+  void _onSubmit() async {
+    final input = _controller.text.trim();
+    if (input.isNotEmpty) {
+      // Add user message to chat
+      setState(() {
+        chatEntries.add(ChatEntry(
+          role: Role.user,
+          timestamp: DateTime.now().toString(),
+          content: input,
+          scores: [],
+        ));
+      });
+      
+      // Query Pinecone for enhanced responses
+      if (ConfigManager.instance.pineconeApiKey.isNotEmpty) {
+        // Show loading indicator
+        setState(() {
+          chatEntries.add(ChatEntry(
+            role: Role.assistant,
+            timestamp: DateTime.now().toString(),
+            content: "🤔 Searching knowledge base...",
+            scores: [],
+          ));
+        });
+        
+        try {
+          final pineconeResponse = await _pineconeService.queryNissanAssistant(input);
+          
+          // Remove loading message and add Pinecone response
+          setState(() {
+            chatEntries.removeLast(); // Remove loading message
+            if (pineconeResponse != null) {
+              chatEntries.add(ChatEntry(
+                role: Role.assistant,
+                timestamp: DateTime.now().toString(),
+                content: "📚 Knowledge Base: $pineconeResponse",
+                scores: [],
+              ));
+            }
+          });
+          
+          // Convert Pinecone response to speech
+          if (pineconeResponse != null) {
+            _convertToSpeechAndPlay(pineconeResponse);
+          }
+        } catch (e) {
+          setState(() {
+            chatEntries.removeLast(); // Remove loading message
+            chatEntries.add(ChatEntry(
+              role: Role.assistant,
+              timestamp: DateTime.now().toString(),
+              content: "❌ Could not fetch from knowledge base. Please try again.",
+              scores: [],
+            ));
+          });
+        }
+      }
+      
+      // Send to Hume AI if connected
+      if (_isConnected && _chatChannel != null) {
+        // For text input, we can send it as a message
+        _sendTextMessage(input);
+      }
+      
+      _controller.clear();
+    }
+  }
+
+  void _onEngineOilPressed() {
+    final message = "Tell me about engine oil maintenance for my Nissan vehicle.";
+    _controller.text = message;
+    _onSubmit();
+  }
+
+  void _onTirePressurePressed() {
+    final message = "What should I know about tire pressure for my Nissan?";
+    _controller.text = message;
+    _onSubmit();
+  }
+
   @override
   Widget build(BuildContext context) {
-    final muteButton = _isMuted
-        ? ElevatedButton(
-            onPressed: _unmuteInput,
-            child: const Text('Unmute'),
-          )
-        : ElevatedButton(
-            onPressed: _muteInput,
-            child: const Text('Mute'),
-          );
-    final connectButton = _isConnected
-        ? ElevatedButton(
-            onPressed: _disconnect,
-            child: const Text('Disconnect'),
-          )
-        : ElevatedButton(
-            onPressed: _connect,
-            child: const Text('Connect'),
-          );
     return Scaffold(
-      appBar: AppBar(
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        title: Text(widget.title),
-      ),
-      body: Center(
-          child: ConstrainedBox(
-              constraints: BoxConstraints(maxWidth: 600),
-              child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: <Widget>[
-                    Text(
-                      'You are ${_isConnected ? 'connected' : 'disconnected'}',
-                      style: const TextStyle(
-                          fontSize: 18, fontWeight: FontWeight.bold),
+      backgroundColor: Colors.white,
+      body: Column(
+        children: [
+          const SizedBox(height: 60),
+          Center(
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                // Nissan logo
+                Image.asset(
+                  'nissan-seeklogo.png',
+                  height: 100,
+                  width: 100,
+                ),
+                const SizedBox(width: 16),
+                // Connection status indicator
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: _isConnected ? Colors.green : Colors.red,
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Text(
+                    _isConnected ? 'Connected' : 'Disconnected',
+                    style: const TextStyle(color: Colors.white, fontSize: 12),
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          // Chat section
+          Expanded(
+            child: chatEntries.isEmpty
+                ? const Center(
+                    child: Text(
+                      "Ask me anything about your Nissan vehicle!",
+                      style: TextStyle(
+                        fontSize: 16,
+                        color: Colors.grey,
+                      ),
                     ),
-                    Expanded(child: ChatDisplay(entries: chatEntries)),
-                    Padding(
-                        padding: const EdgeInsets.all(8.0),
-                        child: Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                            children: <Widget>[connectButton, muteButton]))
-                  ]))),
+                  )
+                : ListView.builder(
+                    padding: const EdgeInsets.all(16),
+                    itemCount: chatEntries.length,
+                    itemBuilder: (context, index) {
+                      final entry = chatEntries[index];
+                      final isUser = entry.role == Role.user;
+                      return Align(
+                        alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
+                        child: Container(
+                          margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 12),
+                          padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 14),
+                          decoration: BoxDecoration(
+                            color: isUser ? Colors.orange : Colors.grey.shade200,
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          constraints: BoxConstraints(
+                            maxWidth: MediaQuery.of(context).size.width * 0.7,
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                entry.content,
+                                style: TextStyle(
+                                  color: isUser ? Colors.white : Colors.black,
+                                  fontSize: 16,
+                                ),
+                              ),
+                              // Add speak button for assistant messages
+                              if (!isUser && !entry.content.contains("🤔 Searching"))
+                                Padding(
+                                  padding: const EdgeInsets.only(top: 8.0),
+                                  child: InkWell(
+                                    onTap: () => _convertToSpeechAndPlay(entry.content),
+                                    child: Container(
+                                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                      decoration: BoxDecoration(
+                                        color: Colors.blue.shade100,
+                                        borderRadius: BorderRadius.circular(8),
+                                      ),
+                                      child: Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          Icon(Icons.volume_up, size: 16, color: Colors.blue.shade700),
+                                          const SizedBox(width: 4),
+                                          Text(
+                                            "Speak",
+                                            style: TextStyle(
+                                              color: Colors.blue.shade700,
+                                              fontSize: 12,
+                                              fontWeight: FontWeight.w500,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+
+          // Control buttons
+          Align(
+            alignment: Alignment.centerRight,
+            child: Padding(
+              padding: const EdgeInsets.only(right: 16.0),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // Connect/Disconnect button
+                  FloatingActionButton(
+                    heroTag: 'connect',
+                    onPressed: _isConnected ? _disconnect : _connect,
+                    tooltip: _isConnected ? 'Disconnect' : 'Connect',
+                    backgroundColor: _isConnected ? Colors.red : Colors.green,
+                    child: Icon(_isConnected ? Icons.stop : Icons.play_arrow),
+                  ),
+                  const SizedBox(width: 16),
+                  // Mute/Unmute button (only show when connected)
+                  if (_isConnected)
+                    FloatingActionButton(
+                      heroTag: 'mute',
+                      onPressed: _isMuted ? _unmuteInput : _muteInput,
+                      tooltip: _isMuted ? 'Unmute' : 'Mute',
+                      backgroundColor: _isMuted ? Colors.orange : Colors.grey,
+                      child: Icon(_isMuted ? Icons.mic_off : Icons.mic),
+                    ),
+                  const SizedBox(width: 16),
+                  FloatingActionButton(
+                    heroTag: 'btn1',
+                    onPressed: _onEngineOilPressed,
+                    tooltip: 'Engine Oil',
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    backgroundColor: Colors.orange,
+                    child: const Icon(Icons.oil_barrel, color: Colors.white),
+                  ),
+                  const SizedBox(width: 16),
+                  FloatingActionButton(
+                    heroTag: 'btn2',
+                    onPressed: _onTirePressurePressed,
+                    tooltip: 'Tire Pressure',
+                    backgroundColor: Colors.black,
+                    child: const Icon(Icons.tire_repair, color: Colors.white),
+                  ),
+                ],
+              ),
+            ),
+          ),
+
+          const SizedBox(height: 16),
+
+          // Input field
+          Padding(
+            padding: const EdgeInsets.all(16.0),
+            child: TextField(
+              controller: _controller,
+              onSubmitted: (_) => _onSubmit(),
+              decoration: InputDecoration(
+                hintText: 'Enter your query here...',
+                suffixIcon: IconButton(
+                  icon: const Icon(Icons.send),
+                  onPressed: _onSubmit,
+                ),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 
   @override
   void dispose() {
+    _controller.dispose();
     _audio.dispose();
     super.dispose();
+  }
+
+  void _sendTextMessage(String text) {
+    if (_chatChannel != null) {
+      _chatChannel!.sink.add(jsonEncode({
+        'type': 'user_input',
+        'text': text,
+      }));
+    }
   }
 
   // Opens a websocket connection to the EVI API and registers a listener to handle
@@ -225,7 +497,7 @@ class _MyHomePageState extends State<MyHomePage> {
     } else if (ConfigManager.instance.humeApiKey.isNotEmpty) {
       uri += '?api_key=${ConfigManager.instance.humeApiKey}';
     } else {
-      throw Exception('Please set your Hume API credentials in main.dart');
+      throw Exception('Please set your Hume API credentials in .env file');
     }
 
     if (ConfigManager.instance.humeConfigId.isNotEmpty) {
@@ -263,6 +535,11 @@ class _MyHomePageState extends State<MyHomePage> {
           case (evi.UserMessage userMessage):
             appendNewChatMessage(userMessage.message, userMessage.models);
             _handleInterruption();
+            
+            // Query Pinecone for additional context when user speaks
+            if (ConfigManager.instance.pineconeApiKey.isNotEmpty) {
+              _queryPineconeForVoiceInput(userMessage.message.content);
+            }
             break;
           case (evi.UnknownMessage unknownMessage):
             debugPrint("Unknown message: ${unknownMessage.rawJson}");
@@ -288,7 +565,6 @@ class _MyHomePageState extends State<MyHomePage> {
     _chatChannel?.sink.close();
     debugPrint("Disconnected");
   }
-
 
   void _handleConnectionClosed() {
     setState(() {
@@ -348,5 +624,44 @@ class _MyHomePageState extends State<MyHomePage> {
     setState(() {
       _isMuted = false;
     });
+  }
+
+  /// Query Pinecone when user speaks to EVI
+  void _queryPineconeForVoiceInput(String userSpeech) async {
+    try {
+      final pineconeResponse = await _pineconeService.queryNissanAssistant(userSpeech);
+      
+      if (pineconeResponse != null) {
+        setState(() {
+          chatEntries.add(ChatEntry(
+            role: Role.assistant,
+            timestamp: DateTime.now().toString(),
+            content: "💡 Knowledge Insight: $pineconeResponse",
+            scores: [],
+          ));
+        });
+        
+        // Convert to speech for voice input as well
+        _convertToSpeechAndPlay(pineconeResponse);
+      }
+    } catch (e) {
+      debugPrint("Error querying Pinecone for voice input: $e");
+    }
+  }
+
+  /// Convert text to speech using Hume TTS and play it
+  void _convertToSpeechAndPlay(String text) async {
+    try {
+      final audioData = await _ttsService.textToSpeech(text);
+      if (audioData != null) {
+        // Convert Uint8List to base64 for audio playback
+        final base64Audio = base64Encode(audioData);
+        _audio.enqueueAudio(base64Audio);
+        
+        debugPrint("Playing TTS audio for: ${text.substring(0, text.length > 50 ? 50 : text.length)}...");
+      }
+    } catch (e) {
+      debugPrint("Error converting text to speech: $e");
+    }
   }
 }
